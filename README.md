@@ -6,6 +6,20 @@ Built as a production-minded prototype with rate-limiting, checkpointing, dedupl
 
 ---
 
+## Why This Approach
+
+**Hybrid Playwright + httpx** — reconnaissance showed category listing pages are client-side rendered (JavaScript) while product detail pages are server-rendered HTML. Using Playwright everywhere would be 10× slower and more fragile; using plain HTTP everywhere would miss the product URLs entirely. The hybrid approach uses the right tool for each page type.
+
+**Sitemap-first discovery** — `products.xml` contains ~1200 product URLs and `catalog.xml` contains ~530 category URLs. Starting from the sitemap is O(categories), not O(pages-crawled), and sidesteps `?page=` pagination which `robots.txt` explicitly disallows.
+
+**LLM as last resort, not first reach** — the site exposes JSON-LD structured data on every product page, making deterministic extraction reliable and fast. LLM fallback is wired in and gated behind a config flag (`llm.enabled: true`) so it activates only for layout-irregular pages. In the sample run, zero LLM calls were needed. This keeps cost and latency predictable and keeps the pipeline auditable.
+
+**SQLite for storage** — portable, zero-infra, queryable with standard SQL, and the schema mirrors a Postgres schema exactly. Swap the connection string to scale up; no application code changes needed.
+
+**Config-driven selectors** — CSS selectors live in `config/selectors.yaml`, not in source code. When the site drifts, operators update YAML; no redeploy required.
+
+---
+
 ## Architecture
 
 ```
@@ -248,6 +262,35 @@ FROM crawl_runs ORDER BY started_at DESC LIMIT 5;
 - **Structured logs:** `structlog` JSONL → `logs/crawl.jsonl`. Every page fetch, extraction result, and error has `run_id`, `url`, `elapsed_ms`, and `level`.
 - **Debug bundles:** On any extraction failure, `debug/{url_hash}/` contains `html.gz`, `screenshot.png` (if browser), and `error.json`.
 - **Per-run quality report:** `data/reports/run-{ts}.md` — counts, missing-field rates, extraction-method distribution, latency percentiles.
+
+---
+
+## Failure Handling
+
+Every failure path is handled at three levels:
+
+**HTTP / network errors** (`http/client.py`)
+- `RetryableError` (5xx, connection reset, timeout) → `tenacity` retries with exponential backoff (3 attempts, 1s–8s window)
+- `FatalHTTPError` (4xx) → logged and skipped; URL marked `failed` in `crawl_state` table so it is not retried on resume
+
+**Extraction failures** (`agents/extractor.py`, `observability/debug_bundle.py`)
+- If all five extraction tiers fail to produce a required field, the page is treated as a failure
+- A debug bundle is written to `debug/{url_hash}/`: `html.gz` (full page source), `screenshot.png` (if rendered via browser), `error.json` (exception class, message, traceback, URL, timestamp)
+- The failure is counted in the run report under "Failed pages" and "Failures by error class"
+
+**Validation failures** (`agents/validator.py`)
+- Products that fail Pydantic validation (missing required `name` or `product_url`) are rejected and logged; the URL is not retried unless the extractor is fixed
+- Soft failures (missing optional fields) are accepted; missing-field rates appear in the quality report
+
+**Resume / checkpointing** (`storage/sqlite.py`, `orchestrator.py`)
+- `crawl_state` table records `pending → in_progress → done / failed` per URL
+- Killing the process mid-run and restarting picks up from `pending` URLs; no duplicate work
+- `crawl_runs` table tracks start/finish time and counts per run for audit
+
+**Rate limit / politeness**
+- `aiolimiter` token bucket enforces ≤1 req/s by default; burst=3 for brief bursts
+- All requests carry a descriptive `User-Agent` header (configurable)
+- `robots.txt` is checked before any URL is added to the frontier
 
 ---
 
