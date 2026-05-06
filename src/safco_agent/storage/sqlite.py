@@ -248,6 +248,13 @@ class Store:
     def product_count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
 
+    def brand_counts(self, limit: int = 15) -> list[tuple[str, int]]:
+        rows = self._conn.execute(
+            "SELECT COALESCE(brand,'<unknown>') as b, COUNT(*) c FROM products GROUP BY b ORDER BY c DESC LIMIT ?",
+            (limit,),
+        )
+        return [(r["b"], r["c"]) for r in rows]
+
     def specs_for(self, dedup_key: str) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(

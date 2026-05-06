@@ -13,8 +13,10 @@ URLs in 'done' status.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
 
@@ -222,9 +224,6 @@ class Orchestrator:
         )
 
     def _product_from_llm(self, url: str, d: dict, seed_id: str, run_id: str) -> Product:
-        from decimal import Decimal, InvalidOperation
-        import re
-
         price = None
         price_text = d.get("price")
         if price_text:

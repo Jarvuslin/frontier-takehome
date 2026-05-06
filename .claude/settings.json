@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unset VIRTUAL_ENV)",
+      "Bash(SAFCO_MAX_PRODUCTS_PER_CATEGORY=10 LOG_FORMAT=console uv run safco discover --seed gloves)",
+      "Bash(SAFCO_MAX_PRODUCTS_PER_CATEGORY=5 LOG_FORMAT=console uv run safco crawl --seed gloves)",
+      "Bash(rm -f data/products.db data/products.db-wal data/products.db-shm)",
+      "Bash(SAFCO_MAX_PRODUCTS_PER_CATEGORY=25 LOG_FORMAT=console uv run safco crawl)",
+      "Bash(uv pip *)"
+    ]
+  }
+}

@@ -103,10 +103,8 @@ def stats(config: Path = typer.Option(None, "--config", "-c")) -> None:
     n = store.product_count()
     console.print(f"[bold]Products in DB:[/] {n}")
     table = Table("Brand", "Count")
-    for row in store._conn.execute(
-        "SELECT COALESCE(brand,'<unknown>') as b, COUNT(*) c FROM products GROUP BY b ORDER BY c DESC LIMIT 15"
-    ):
-        table.add_row(row["b"], str(row["c"]))
+    for brand, count in store.brand_counts():
+        table.add_row(brand, str(count))
     console.print(table)
     store.close()
 
