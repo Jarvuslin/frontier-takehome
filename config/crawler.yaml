@@ -1,0 +1,48 @@
+# Crawler configuration. All values overridable via env (SAFCO_*) or CLI flags.
+site:
+  base_url: "https://www.safcodental.com"
+  user_agent: "SafcoCatalogBot/0.1 (+evaluation prototype; contact: yuchen)"
+
+# Seeds — the two assignment categories. Add more without code change.
+seeds:
+  - id: sutures-surgical-products
+    url: "https://www.safcodental.com/catalog/sutures-surgical-products"
+    label: "Sutures & surgical products"
+  - id: gloves
+    url: "https://www.safcodental.com/catalog/gloves"
+    label: "Dental Exam Gloves"
+
+# Politeness / pacing
+rate_limit:
+  requests_per_second: 1.0
+  burst: 2
+
+timeouts:
+  http_seconds: 20
+  browser_seconds: 30
+  page_settle_seconds: 4
+
+# Demo cap. Set to 0 (or null) for full crawl. ~50 keeps eval runs <10 min.
+limits:
+  max_products_per_category: 50
+  max_concurrent_http: 4
+  max_concurrent_browser: 2
+
+# Retry policy is hard-coded by error class in code; tunables here:
+retries:
+  http_max_attempts: 3
+  browser_max_attempts: 2
+
+# Storage
+paths:
+  sqlite: "data/products.db"
+  exports_dir: "data/exports"
+  reports_dir: "data/reports"
+  debug_dir: "debug"
+  logs_dir: "logs"
+
+# LLM fallback (off by default; toggled via env LLM_FALLBACK_ENABLED)
+llm_fallback:
+  enabled: false
+  trigger_when_missing: ["name", "product_url"]
+  max_calls_per_run: 25

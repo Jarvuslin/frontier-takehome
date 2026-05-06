@@ -1,0 +1,14 @@
+# Local convenience for running the crawler in a container.
+# `docker compose run crawler` runs both seed categories with shared volumes.
+services:
+  crawler:
+    build: .
+    image: safco-agent:latest
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./debug:/app/debug
+      - ./config:/app/config:ro
+    command: ["crawl"]

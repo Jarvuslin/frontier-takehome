@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.uv/
+build/
+dist/
+
+# Env / secrets
+.env
+.env.local
+
+# Generated runtime artifacts
+data/products.db
+data/products.db-journal
+data/exports/
+data/reports/
+debug/
+logs/
+*.log
+
+# Playwright
+.playwright/
+ms-playwright/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Keep
+!data/samples/
+!data/samples/**
+!tests/fixtures/
+!tests/fixtures/**

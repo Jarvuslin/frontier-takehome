@@ -1,0 +1,71 @@
+# Live-editable CSS selector rules per page type. The ExtractorAgent applies
+# these AFTER JSON-LD / OpenGraph / microdata have run. Selector drift is
+# fixed here without code changes.
+#
+# Each entry maps a logical field to an ordered list of (selector, attr) pairs.
+# The first non-empty match wins. attr=text means innerText.
+
+product_page:
+  name:
+    - { sel: "h1.product-title", attr: text }
+    - { sel: "h1[itemprop=name]", attr: text }
+    - { sel: "h1", attr: text }
+  brand:
+    - { sel: "[itemprop=brand]", attr: text }
+    - { sel: "a.product-brand", attr: text }
+    - { sel: ".product-manufacturer a", attr: text }
+  sku:
+    - { sel: "[itemprop=sku]", attr: text }
+    - { sel: ".product-sku .value", attr: text }
+    - { sel: ".sku .value", attr: text }
+  product_code:
+    - { sel: ".product-code .value", attr: text }
+    - { sel: "[data-product-code]", attr: "data-product-code" }
+  price:
+    - { sel: "[itemprop=price]", attr: content }
+    - { sel: "meta[property='product:price:amount']", attr: content }
+    - { sel: ".product-price .price", attr: text }
+    - { sel: ".price-final_price .price", attr: text }
+    - { sel: ".price", attr: text }
+  availability:
+    - { sel: "[itemprop=availability]", attr: href }
+    - { sel: "meta[property='product:availability']", attr: content }
+    - { sel: ".stock-status", attr: text }
+    - { sel: ".product-availability", attr: text }
+  description:
+    - { sel: "[itemprop=description]", attr: text }
+    - { sel: ".product-description", attr: text }
+    - { sel: "#description", attr: text }
+    - { sel: "meta[name=description]", attr: content }
+  pack_size:
+    - { sel: ".product-pack-size", attr: text }
+    - { sel: "[data-pack-size]", attr: "data-pack-size" }
+  breadcrumbs:
+    - { sel: "nav.breadcrumbs a", attr: text, multi: true }
+    - { sel: ".breadcrumb a", attr: text, multi: true }
+    - { sel: "[itemprop=breadcrumb] a", attr: text, multi: true }
+  images:
+    - { sel: ".product-gallery img", attr: src, multi: true }
+    - { sel: ".gallery img", attr: src, multi: true }
+    - { sel: "img[itemprop=image]", attr: src, multi: true }
+    - { sel: "meta[property='og:image']", attr: content }
+  specs_rows:
+    # rows of (label, value); parser handles tr / dt-dd / li patterns.
+    - { sel: "table.product-specs tr", multi: true }
+    - { sel: ".product-specifications dl > *", multi: true }
+    - { sel: ".specs-table tr", multi: true }
+  alternatives:
+    - { sel: ".related-products a.product-link", attr: href, multi: true }
+    - { sel: ".alternatives a", attr: href, multi: true }
+
+listing_page:
+  product_card_link:
+    - { sel: "a.product-card", attr: href, multi: true }
+    - { sel: ".product-list-item a.product-link", attr: href, multi: true }
+    - { sel: "a[href*='/product/']", attr: href, multi: true }
+  pagination_next:
+    - { sel: "a[rel=next]", attr: href }
+    - { sel: ".pagination .next a", attr: href }
+  load_more_button:
+    - { sel: "button:has-text('Load more')" }
+    - { sel: ".load-more" }
