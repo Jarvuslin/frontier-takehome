@@ -11,6 +11,9 @@ seeds:
   - id: gloves
     url: "https://www.safcodental.com/catalog/gloves"
     label: "Dental Exam Gloves"
+  - id: infection-control
+    url: "https://www.safcodental.com/catalog/infection-control"
+    label: "Infection Control"
 
 # Politeness / pacing
 rate_limit:
@@ -36,7 +39,7 @@ retries:
 # Storage
 paths:
   sqlite: "data/products.db"
-  exports_dir: "data/exports"
+  exports_dir: "output"           # CSV / JSONL / grouped JSON exports
   reports_dir: "data/reports"
   debug_dir: "debug"
   logs_dir: "logs"

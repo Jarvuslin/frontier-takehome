@@ -31,9 +31,14 @@ from safco_agent.http.client import FatalHTTPError, HTTPClient, RetryableError
 from safco_agent.observability import debug_bundle
 from safco_agent.observability.logging import configure_logging, get_logger
 from safco_agent.observability.report import RunStats, write_report
-from safco_agent.schema import Product
+from safco_agent.schema import Product, Variant
 from safco_agent.settings import SeedConfig, Settings, load_selectors
-from safco_agent.storage.exporters import export_csv, export_jsonl, export_specs_csv
+from safco_agent.storage.exporters import (
+    export_grouped_json,
+    export_specifications_jsonl,
+    export_variant_csv,
+    seed_to_slug,
+)
 from safco_agent.storage.sqlite import Store
 
 log = get_logger("orchestrator")
@@ -105,6 +110,9 @@ class Orchestrator:
             stats.duplicates = self.validator.duplicates
             stats.products_rejected = self.validator.rejected
             stats.products_extracted = self.validator.accepted
+            stats.variants_extracted = self.validator.variants_accepted
+            stats.variants_rejected = self.validator.variants_rejected
+            stats.variants_duplicates = self.validator.variants_duplicates
 
             self.store.finish_run(
                 run_id=run_id,
@@ -175,13 +183,13 @@ class Orchestrator:
             return
 
         stats.latencies_ms.append(r.elapsed_ms)
-        product, methods = self.extractor.extract(url, r.text)
+        product, variants, methods = self.extractor.extract(url, r.text)
 
         if product is None and self.llm.available:
             log.info("orch.llm_fallback", url=url)
             llm_data = self.llm.extract(url, r.text)
             if llm_data and llm_data.get("name"):
-                product = self._product_from_llm(url, llm_data, seed.id, run_id)
+                product, variants = self._product_from_llm(url, llm_data, seed.id, run_id)
                 methods = {k: "llm" for k in llm_data.keys() if llm_data.get(k)}
 
         if product is None:
@@ -210,6 +218,17 @@ class Orchestrator:
             return
 
         self.store.upsert_product(product)
+
+        # Variants — set parent_dedup_key (extractor cannot know it yet because
+        # source_seed and crawl_run_id are stamped here), then validate and persist.
+        accepted_variants = []
+        for v in variants:
+            v.parent_dedup_key = product.dedup_key
+            ok, _reason = self.validator.validate_variant(v)
+            if ok:
+                accepted_variants.append(v)
+        self.store.upsert_variants(product.dedup_key, accepted_variants)
+
         self.store.mark_done(url)
         missing = [
             f for f in ("sku", "brand", "price", "description")
@@ -219,11 +238,20 @@ class Orchestrator:
         log.info(
             "orch.product",
             url=url, sku=product.sku, name=product.name[:60],
+            variants=len(accepted_variants),
             price=str(product.price) if product.price else None,
             elapsed_ms=int((time.perf_counter() - t0) * 1000),
         )
 
-    def _product_from_llm(self, url: str, d: dict, seed_id: str, run_id: str) -> Product:
+    def _product_from_llm(
+        self, url: str, d: dict, seed_id: str, run_id: str
+    ) -> tuple[Product, list[Variant]]:
+        """LLM-fallback path: build the parent Product and one synthetic Variant.
+
+        The LLM only sees a stripped page snippet and returns flat fields; we
+        don't ask it to enumerate variants. One synthetic Variant per parent
+        keeps the variant-grain contract intact for downstream code.
+        """
         price = None
         price_text = d.get("price")
         if price_text:
@@ -233,7 +261,7 @@ class Orchestrator:
                     price = Decimal(m.group(0).replace(",", ""))
                 except InvalidOperation:
                     price = None
-        return Product(
+        product = Product(
             sku=d.get("sku"),
             name=d["name"],
             brand=d.get("brand"),
@@ -249,10 +277,45 @@ class Orchestrator:
             crawl_run_id=run_id,
             extraction_method={"_": "llm"},
         )
+        synthetic = Variant(
+            parent_dedup_key=product.dedup_key,
+            parent_sku=product.sku,
+            safco_item_number=product.sku,
+            manufacturer_name=product.brand,
+            name=product.name,
+            description=product.description,
+            price=product.price,
+            price_text=product.price_text,
+            currency=None,
+            availability=product.availability,
+            is_synthetic=True,
+            extraction_method={"_": "llm"},
+        )
+        return product, [synthetic]
 
     def _export(self, run_id: str) -> None:
-        exports = self.settings.repo_path(self.settings.paths.exports_dir)
-        n_csv = export_csv(self.store, exports / "products.csv")
-        n_jsonl = export_jsonl(self.store, exports / "products.jsonl")
-        n_specs = export_specs_csv(self.store, exports / "specifications.csv")
-        log.info("export.done", csv=n_csv, jsonl=n_jsonl, specs=n_specs)
+        """Write the four required output files plus optional grouped JSON.
+
+        - `products_all.csv`         flat, one row per variant (master export)
+        - `products_<seed>.csv`      same shape, filtered to one seed
+        - `specifications.jsonl`     parent-grouped, one product per line,
+                                      nested variants + parsed specs
+        - `products_grouped.json`    optional readable JSON array (best-effort)
+        """
+        out = self.settings.repo_path(self.settings.paths.exports_dir)
+
+        n_all = export_variant_csv(self.store, out / "products_all.csv")
+        per_seed: dict[str, int] = {}
+        for seed in self.settings.seeds:
+            slug = seed_to_slug(seed.id)
+            per_seed[slug] = export_variant_csv(
+                self.store, out / f"products_{slug}.csv", seed_filter=seed.id
+            )
+        n_jsonl = export_specifications_jsonl(self.store, out / "specifications.jsonl")
+        n_grouped = export_grouped_json(self.store, out / "products_grouped.json")
+
+        log.info(
+            "export.done",
+            products_all=n_all, per_seed=per_seed,
+            specifications_jsonl=n_jsonl, grouped_json=n_grouped,
+        )

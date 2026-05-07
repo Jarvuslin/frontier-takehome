@@ -26,6 +26,12 @@ class RunStats:
     duplicates: int = 0
     failures: int = 0
 
+    # Variant-grain counters, separate from products_extracted so the
+    # parent-page totals stay meaningful. One product can yield many variants.
+    variants_extracted: int = 0
+    variants_rejected: int = 0
+    variants_duplicates: int = 0
+
     failures_by_class: dict[str, int] = field(default_factory=dict)
     extraction_methods: dict[str, Counter] = field(default_factory=dict)  # field -> Counter
     missing_fields: Counter = field(default_factory=Counter)
@@ -70,7 +76,10 @@ class RunStats:
             f"| Pages visited | {self.pages_visited} |",
             f"| Products extracted (accepted) | {self.products_extracted} |",
             f"| Products rejected (validator) | {self.products_rejected} |",
-            f"| Duplicates skipped | {self.duplicates} |",
+            f"| Product duplicates skipped | {self.duplicates} |",
+            f"| Variants extracted (accepted) | {self.variants_extracted} |",
+            f"| Variants rejected (validator) | {self.variants_rejected} |",
+            f"| Variant duplicates skipped | {self.variants_duplicates} |",
             f"| Failed pages | {self.failures} |",
             f"| LLM fallback calls | {self.llm_calls} |",
             f"| Latency p50 (ms) | {d['latency_ms_p50']} |",

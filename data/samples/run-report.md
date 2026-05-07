@@ -1,21 +1,24 @@
-# Crawl Run Report — `aea031596e4e`
+# Crawl Run Report — `492fe3d3491f`
 
-- **Started:**  2026-05-06T02:03:25.942046+00:00
-- **Finished:** 2026-05-06T02:04:54.862879+00:00
+- **Started:**  2026-05-07T01:30:01.205963+00:00
+- **Finished:** 2026-05-07T01:33:25.461782+00:00
 - **Seeds:**    sutures-surgical-products, gloves
 
 ## Summary
 
 | Metric | Value |
 |---|---|
-| Pages visited | 50 |
-| Products extracted (accepted) | 49 |
+| Pages visited | 98 |
+| Products extracted (accepted) | 97 |
 | Products rejected (validator) | 0 |
-| Duplicates skipped | 1 |
+| Product duplicates skipped | 1 |
+| Variants extracted (accepted) | 463 |
+| Variants rejected (validator) | 0 |
+| Variant duplicates skipped | 0 |
 | Failed pages | 0 |
 | LLM fallback calls | 0 |
-| Latency p50 (ms) | 1133 |
-| Latency p95 (ms) | 1822 |
+| Latency p50 (ms) | 1172 |
+| Latency p95 (ms) | 1864 |
 
 ## Failures by error class
 
@@ -27,11 +30,13 @@ _All tracked fields populated._
 
 ## Extraction-method distribution
 
-- **name**: json-ld=49 (100%)
-- **brand**: json-ld=49 (100%)
-- **sku**: json-ld=49 (100%)
-- **price**: json-ld=49 (100%)
-- **availability**: json-ld=49 (100%)
-- **description**: json-ld=49 (100%)
-- **category_path**: selector=49 (100%)
-- **image_urls**: json-ld=49 (100%)
+- **name**: json-ld=97 (100%)
+- **brand**: json-ld=97 (100%)
+- **sku**: json-ld=97 (100%)
+- **price**: json-ld=97 (100%)
+- **availability**: json-ld=97 (100%)
+- **description**: json-ld=97 (100%)
+- **category_path**: selector=97 (100%)
+- **image_urls**: json-ld=97 (100%)
+- **specifications**: selector=62 (100%)
+- **pack_size**: description-heuristic=41 (98%), specs-heuristic=1 (2%)

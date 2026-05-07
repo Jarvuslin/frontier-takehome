@@ -9,6 +9,7 @@ Tiers (per field, first non-empty wins; method recorded):
 """
 from __future__ import annotations
 
+import html as html_module
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -18,11 +19,85 @@ from urllib.parse import urljoin
 from selectolax.parser import HTMLParser, Node
 
 from safco_agent.observability.logging import get_logger
-from safco_agent.schema import Availability, Product
+from safco_agent.schema import Availability, Product, Variant
 
 log = get_logger("agent.extractor")
 
+# Variant data is embedded in product pages as JS: `window.masterData = "..."`.
+# The captured string is a JS string literal containing \uXXXX escapes whose
+# decoded form is itself a JSON object keyed by Safco item number.
+_MASTERDATA_RE = re.compile(r'window\.masterData\s*=\s*"([^"]+)"')
+
+# Size/pack pattern for variant descriptions like "X-small, 200/box".
+_SIZE_PACK_RE = re.compile(r"^\s*([^,]+?)\s*,\s*(\d+)\s*/\s*([A-Za-z]+)\s*$")
+
+
+def _parse_master_data(html: str) -> dict[str, dict] | None:
+    """Extract and decode the masterData blob from a product page.
+
+    Returns a {item_number: variant_dict} mapping, or None if not present
+    or if any decoding step fails. The double json.loads is intentional:
+    the captured string is a JS string literal — `json.loads` of the wrapped
+    form unescapes the \\uXXXX sequences; the resulting string is itself JSON.
+    """
+    m = _MASTERDATA_RE.search(html)
+    if not m:
+        return None
+    try:
+        decoded = json.loads('"' + m.group(1) + '"')
+        data = json.loads(decoded)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("masterdata.parse_failed", error=str(e))
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_size_pack(description: str | None) -> tuple[str | None, int | None, str | None]:
+    """Parse a variant description like "X-small, 200/box" into (size, qty, unit).
+
+    Returns (None, None, None) if the description doesn't fit the pattern.
+    """
+    if not description:
+        return None, None, None
+    m = _SIZE_PACK_RE.match(description)
+    if not m:
+        return None, None, None
+    return m.group(1).strip(), int(m.group(2)), m.group(3).lower()
+
 PRICE_RE = re.compile(r"(?P<num>\d{1,3}(?:[,\d]{0,9})(?:\.\d{1,2})?)")
+
+# Pack-size patterns, tried in priority order. Listing longer unit names first
+# (`package` before `pack`) prevents a prefix-match cutting "package" → "pack".
+# Intermediate words use [a-zA-Z]+ (not \w+) so digit-containing tokens like
+# "3.1" in "3.1 mils 300 gloves per box" can't bridge two separate numbers.
+_UNITS = r"(?:carton|package|case|box|bag|pkg|pack|kit|set)"
+_PACK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\d+\s*/\s*" + _UNITS, re.I),                                  # 12/box
+    re.compile(r"\d+(?:\s+[a-zA-Z]+){0,3}\s+per\s+" + _UNITS, re.I),           # 300 gloves per box
+    re.compile(_UNITS + r"\s+of\s+\d+", re.I),                                 # box of 25
+    re.compile(r"(?:package|pack|pkg|box|set|kit)\s*/\s*\d+", re.I),           # pkg/50
+    re.compile(r"(?:each\s+)?" + _UNITS + r"\s+(?:contains?|holds?|includes?)" # each box contains 200
+               r"\s+\d+(?:\s+[a-zA-Z]+){0,3}", re.I),
+    re.compile(r"\d+(?:\s+[a-zA-Z]+){0,3}\s+(?:in|inside)\s+"                  # 200 gloves in each box
+               r"(?:each\s+|every\s+)?" + _UNITS, re.I),
+)
+
+
+def _find_pack_in_text(text: str | None) -> str | None:
+    """Return the first pack-size phrase found in text, or None.
+
+    Whitespace is normalized to a single space first so that newlines or HTML
+    entity remnants can't bridge two unrelated numbers in the source.
+    """
+    if not text:
+        return None
+    flat = re.sub(r"\s+", " ", str(text))
+    for pattern in _PACK_PATTERNS:
+        m = pattern.search(flat)
+        if m:
+            return m.group(0).strip()
+    return None
+
 AVAILABILITY_MAP = {
     "instock": "in_stock",
     "in_stock": "in_stock",
@@ -33,6 +108,25 @@ AVAILABILITY_MAP = {
     "preorder": "preorder",
     "backorder": "backorder",
 }
+
+
+def _clean_text(text: str | None) -> str | None:
+    """Decode HTML entities and strip any inline tags (common in Magento JSON-LD).
+
+    Some Safco fields are double-encoded — `&amp;nbsp;` in the raw HTML decodes
+    to `&nbsp;` after one pass, which still looks like an entity to a CSV
+    reader. Loop until idempotent (capped) so we land on the real characters.
+    """
+    if not text:
+        return None
+    for _ in range(3):
+        unescaped = html_module.unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
 
 
 def _norm_availability(raw: str | None) -> Availability:
@@ -66,8 +160,16 @@ class Extractor:
         self._sel = selectors.get("product_page", {})
         self.base_url = base_url
 
-    def extract(self, url: str, html: str) -> tuple[Product | None, dict[str, str]]:
-        """Return (Product or None, extraction_method per field). None if name+url missing."""
+    def extract(
+        self, url: str, html: str
+    ) -> tuple[Product | None, list[Variant], dict[str, str]]:
+        """Return (Product, variants, methods).
+
+        - Product is None when name+url are missing.
+        - variants is the list of purchasable item-number rows from masterData,
+          or a single synthetic Variant derived from the parent if no masterData
+          is present (so every page still produces at least one output row).
+        """
         tree = HTMLParser(html)
         method: dict[str, str] = {}
 
@@ -178,15 +280,13 @@ class Extractor:
             method["specifications"] = "selector"
 
         pack_size = pick("pack_size", ("selector", self._sel_text(tree, "pack_size")))
-        if not pack_size and name:
-            # last-resort heuristic on name: e.g. "Gloves Latex 100/box"
-            m = re.search(r"(\d+\s*/\s*(?:box|case|pack|bag|pkg))", name, re.I)
-            if m:
-                pack_size = m.group(1)
-                method["pack_size"] = "name-heuristic"
+        if not pack_size:
+            pack_size, ps_source = self._find_pack_size(name, description, specs, tree)
+            if pack_size:
+                method["pack_size"] = ps_source
 
         if not name:
-            return None, method
+            return None, [], method
 
         product = Product(
             sku=str(sku).strip() if sku else None,
@@ -200,13 +300,129 @@ class Extractor:
             currency=str(currency).upper()[:3] if currency else "USD",
             pack_size=str(pack_size).strip() if pack_size else None,
             availability=availability,
-            description=str(description).strip() if description else None,
+            description=_clean_text(str(description) if description else None),
             specifications=specs,
             image_urls=images,
             alternative_product_urls=alternatives,
             extraction_method=method,
         )
-        return product, method
+
+        variants = self._build_variants(html, product, description)
+        product.variants = variants
+        return product, variants, method
+
+    # ---------- variants ----------
+
+    def _build_variants(
+        self, html: str, product: Product, description: Any
+    ) -> list[Variant]:
+        """Build the per-item-number variants for a product page.
+
+        masterData (when present) is authoritative — it holds Safco's actual
+        purchasable rows including per-variant brand and availability. When
+        masterData is absent (e.g. clearance pages, products that aren't
+        configurable), emit one synthetic Variant from the parent fields so
+        every page still produces an output row.
+        """
+        master = _parse_master_data(html)
+        if master:
+            return [self._variant_from_master(item, product) for item in master.values()]
+        return [self._synthetic_variant(product, description)]
+
+    def _variant_from_master(self, raw: dict, product: Product) -> Variant:
+        """Build a Variant from one masterData entry.
+
+        Field map (per plan):
+          sku                       -> safco_item_number
+          manufacturer_part_number  -> manufacturer_number
+          parent_product_sku        -> parent_sku
+          manufacturer_name         -> manufacturer_name (brand)
+          name, description         -> as-is, after _clean_text
+          product_price             -> price (Decimal) + price_text (raw)
+          stock_availability        -> availability via AVAILABILITY_MAP
+        """
+        size, qty, unit = _parse_size_pack(raw.get("description"))
+        price, price_text = _norm_price(raw.get("product_price"))
+        return Variant(
+            parent_dedup_key=product.dedup_key,
+            parent_sku=raw.get("parent_product_sku") or product.sku,
+            safco_item_number=str(raw.get("sku")).strip() if raw.get("sku") else None,
+            manufacturer_number=raw.get("manufacturer_part_number") or None,
+            manufacturer_name=_clean_text(raw.get("manufacturer_name")),
+            name=_clean_text(raw.get("name")),
+            description=_clean_text(raw.get("description")),
+            price=price,
+            price_text=price_text,
+            currency=None,  # masterData doesn't expose currency; do not guess
+            availability=_norm_availability(raw.get("stock_availability")),
+            availability_label=_clean_text(raw.get("stock_availability_label")),
+            size=size,
+            pack_quantity=qty,
+            pack_unit=unit,
+            image=raw.get("image") or None,
+            main_image=raw.get("main_image") or None,
+            is_synthetic=False,
+            extraction_method={"_": "masterdata"},
+        )
+
+    def _synthetic_variant(self, product: Product, description: Any) -> Variant:
+        """One synthetic Variant for pages without masterData (e.g. clearance)."""
+        size = qty = unit = None
+        pack_phrase = _find_pack_in_text(product.pack_size) or _find_pack_in_text(description)
+        if pack_phrase:
+            # pack_phrase is a fragment like "200/box" or "300 gloves per box";
+            # try the strict size+pack pattern, else just keep qty/unit if present.
+            size, qty, unit = _parse_size_pack(pack_phrase)
+        return Variant(
+            parent_dedup_key=product.dedup_key,
+            parent_sku=product.sku,
+            safco_item_number=product.sku or product.product_code,
+            manufacturer_number=None,
+            manufacturer_name=product.brand,
+            name=product.name,
+            description=product.description,
+            price=product.price,
+            price_text=product.price_text,
+            currency=None,  # do not guess
+            availability=product.availability,
+            availability_label=None,
+            size=size,
+            pack_quantity=qty,
+            pack_unit=unit,
+            image=product.image_urls[0] if product.image_urls else None,
+            main_image=None,
+            is_synthetic=True,
+            extraction_method={"_": "synthetic"},
+        )
+
+    # ---------- pack size ----------
+
+    def _find_pack_size(
+        self,
+        name: str | None,
+        description: Any,
+        specs: dict[str, str],
+        tree: HTMLParser,
+    ) -> tuple[str | None, str]:
+        """Search four sources in priority order; return (value, source_label).
+
+        Sources, in order:
+          1. name           — most reliable when present (e.g. "Gloves 100/box")
+          2. description    — JSON-LD / OG; embeds bullet list for gloves
+          3. specs keys     — already-parsed div.prose ul li bullets (sutures)
+          4. raw prose text — last resort for non-bullet phrasings
+        """
+        if (m := _find_pack_in_text(name)):
+            return m, "name-heuristic"
+        if (m := _find_pack_in_text(description)):
+            return m, "description-heuristic"
+        for key in specs:
+            if (m := _find_pack_in_text(key)):
+                return m, "specs-heuristic"
+        prose = tree.css_first("div.prose")
+        if prose and (m := _find_pack_in_text(prose.text(strip=True))):
+            return m, "prose-heuristic"
+        return None, ""
 
     # ---------- helpers: tiers ----------
     def _collect_jsonld(self, tree: HTMLParser) -> dict[str, Any]:
@@ -373,11 +589,15 @@ def _row_to_pair(node: Node) -> tuple[str, str] | None:
                 return k, v
     if tag == "li":
         txt = node.text(strip=True)
+        if not txt or re.match(r"order\s+\d+", txt, re.I):
+            return None
         if ":" in txt:
             k, v = txt.split(":", 1)
             k, v = k.strip(), v.strip()
             if k and v:
                 return k, v
+        else:
+            return txt, "yes"
     return None
 
 

@@ -15,11 +15,17 @@ dist/
 # Generated runtime artifacts
 data/products.db
 data/products.db-journal
+data/products.db-wal
+data/products.db-shm
 data/exports/
 data/reports/
+output/
 debug/
 logs/
 *.log
+
+# Local config overrides (developers may use crawler.local.yaml for tuning)
+config/*.local.yaml
 
 # Playwright
 .playwright/
@@ -30,6 +36,7 @@ ms-playwright/
 .idea/
 *.swp
 .DS_Store
+.claude/settings.local.json
 
 # Pytest
 .pytest_cache/

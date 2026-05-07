@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from safco_agent.schema import Product
+from safco_agent.schema import Product, Variant
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
@@ -83,6 +83,33 @@ CREATE TABLE IF NOT EXISTS run_log (
     failures       INTEGER DEFAULT 0,
     notes          TEXT
 );
+
+CREATE TABLE IF NOT EXISTS variants (
+    dedup_key                TEXT PRIMARY KEY,
+    parent_dedup_key         TEXT NOT NULL,
+    parent_sku               TEXT,
+    safco_item_number        TEXT,
+    manufacturer_number      TEXT,
+    manufacturer_name        TEXT,    -- variant-level brand
+    name                     TEXT,
+    description              TEXT,
+    price                    REAL,
+    price_text               TEXT,
+    currency                 TEXT,
+    availability             TEXT,
+    availability_label       TEXT,
+    size                     TEXT,
+    pack_quantity            INTEGER,
+    pack_unit                TEXT,
+    image                    TEXT,
+    main_image               TEXT,
+    is_synthetic             INTEGER DEFAULT 0,
+    extraction_method        TEXT,    -- JSON object
+    FOREIGN KEY (parent_dedup_key) REFERENCES products(dedup_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_variants_parent ON variants(parent_dedup_key);
+CREATE INDEX IF NOT EXISTS idx_variants_brand  ON variants(manufacturer_name);
+CREATE INDEX IF NOT EXISTS idx_variants_item   ON variants(safco_item_number);
 """
 
 
@@ -170,6 +197,109 @@ class Store:
                 "INSERT INTO product_alternatives (dedup_key, alternate_url) VALUES (?, ?)",
                 [(p.dedup_key, u) for u in p.alternative_product_urls],
             )
+
+    # ---------- variants ----------
+    def upsert_variants(self, parent_key: str, variants: list[Variant]) -> None:
+        """Replace all variants for a parent product.
+
+        Delete-then-insert (rather than ON CONFLICT) keeps the variant set in
+        lockstep with what masterData currently exposes — variants the page no
+        longer offers are removed, never staled.
+        """
+        with self.tx() as c:
+            c.execute("DELETE FROM variants WHERE parent_dedup_key = ?", (parent_key,))
+            if not variants:
+                return
+            c.executemany(
+                """
+                INSERT INTO variants (
+                    dedup_key, parent_dedup_key, parent_sku,
+                    safco_item_number, manufacturer_number, manufacturer_name,
+                    name, description, price, price_text, currency,
+                    availability, availability_label,
+                    size, pack_quantity, pack_unit,
+                    image, main_image, is_synthetic, extraction_method
+                ) VALUES (
+                    :dedup_key, :parent_dedup_key, :parent_sku,
+                    :safco_item_number, :manufacturer_number, :manufacturer_name,
+                    :name, :description, :price, :price_text, :currency,
+                    :availability, :availability_label,
+                    :size, :pack_quantity, :pack_unit,
+                    :image, :main_image, :is_synthetic, :extraction_method
+                )
+                """,
+                [
+                    {
+                        "dedup_key": v.dedup_key,
+                        "parent_dedup_key": v.parent_dedup_key,
+                        "parent_sku": v.parent_sku,
+                        "safco_item_number": v.safco_item_number,
+                        "manufacturer_number": v.manufacturer_number,
+                        "manufacturer_name": v.manufacturer_name,
+                        "name": v.name,
+                        "description": v.description,
+                        "price": float(v.price) if v.price is not None else None,
+                        "price_text": v.price_text,
+                        "currency": v.currency,
+                        "availability": v.availability,
+                        "availability_label": v.availability_label,
+                        "size": v.size,
+                        "pack_quantity": v.pack_quantity,
+                        "pack_unit": v.pack_unit,
+                        "image": v.image,
+                        "main_image": v.main_image,
+                        "is_synthetic": 1 if v.is_synthetic else 0,
+                        "extraction_method": json.dumps(v.extraction_method),
+                    }
+                    for v in variants
+                ],
+            )
+
+    def all_variants_with_parent(self) -> list[sqlite3.Row]:
+        """One row per variant, joined with the parent product context.
+
+        Source of truth for the variant-level CSV export.
+        """
+        return list(
+            self._conn.execute(
+                """
+                SELECT
+                    v.dedup_key            AS variant_dedup_key,
+                    v.parent_dedup_key     AS parent_dedup_key,
+                    v.parent_sku           AS parent_sku,
+                    v.safco_item_number    AS safco_item_number,
+                    v.manufacturer_number  AS manufacturer_number,
+                    v.manufacturer_name    AS manufacturer_name,
+                    v.name                 AS variant_name,
+                    v.description          AS variant_description,
+                    v.price                AS price,
+                    v.price_text           AS price_text,
+                    v.currency             AS currency,
+                    v.availability         AS availability,
+                    v.availability_label   AS availability_label,
+                    v.size                 AS size,
+                    v.pack_quantity        AS pack_quantity,
+                    v.pack_unit            AS pack_unit,
+                    v.image                AS variant_image_thumb,
+                    v.main_image           AS variant_image_main,
+                    v.is_synthetic         AS is_synthetic,
+                    p.dedup_key            AS p_dedup_key,
+                    p.sku                  AS p_sku,
+                    p.name                 AS parent_name,
+                    p.product_url          AS product_url,
+                    p.category_path        AS category_path_json,
+                    p.description          AS parent_description,
+                    p.source_seed          AS source_seed,
+                    p.extracted_at         AS extracted_at
+                FROM variants v
+                JOIN products p ON p.dedup_key = v.parent_dedup_key
+                ORDER BY p.name, v.size, v.safco_item_number
+                """
+            )
+        )
+
+    def variant_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM variants").fetchone()[0]
 
     # ---------- crawl_state ----------
     def mark_pending(self, url: str, seed_id: str, page_type: str | None = None) -> None:

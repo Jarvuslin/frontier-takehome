@@ -68,41 +68,129 @@ Built as a production-minded prototype with rate-limiting, checkpointing, dedupl
 
 ---
 
-## Schema
+## Data Model — Parent Products vs Variants
 
-Defined in `src/safco_agent/schema.py` (Pydantic v2). Export via `safco schema-dump`.
+Each Safco product page is a **parent product** (the catalog/master record). Inside that page is a table of **purchasable variants** — one row per orderable item, each with its own Safco item number, manufacturer number, size, pack quantity, price, and availability. One parent typically yields 4–10 variants (sizes XS/S/M/L/XL × pack options).
+
+We model both:
 
 ```python
 class Product(BaseModel):
-    # Identity
-    sku: str | None
-    product_code: str | None
-    name: str                           # required
-    brand: str | None
+    """Parent product — the page-level master record."""
+    sku: str | None              # parent SKU (Magento configurable SKU)
+    name: str
+    brand: str | None            # JSON-LD field — often inaccurate (= retailer)
     category_path: list[str]
-    product_url: str                    # required; canonicalized (fragment + trailing slash stripped)
-
-    # Commercial
-    price: Decimal | None
-    price_text: str | None
-    currency: str = "USD"
-    pack_size: str | None
-    availability: Literal["in_stock", "out_of_stock", "backorder", "preorder", "unknown"]
-
-    # Descriptive
+    product_url: str
     description: str | None
     specifications: dict[str, str]
     image_urls: list[str]
     alternative_product_urls: list[str]
+    variants: list[Variant]      # nested
+    # ... + price/availability/etc inherited from JSON-LD
 
-    # Provenance
-    source_seed: str | None
-    extraction_method: dict[str, str]   # {"name": "json-ld", "price": "selector", ...}
-    extracted_at: datetime
-    crawl_run_id: str | None
+
+class Variant(BaseModel):
+    """One purchasable item-number row from window.masterData."""
+    parent_dedup_key: str
+    parent_sku: str | None
+    safco_item_number: str       # Item # (Safco internal)
+    manufacturer_number: str     # Mfr # (e.g. ALGA200XS)
+    manufacturer_name: str       # actual brand (e.g. Dash, Halyard)
+    name: str
+    description: str             # e.g. "X-small, 200/box"
+    price: Decimal | None
+    currency: str | None         # never defaulted — null when undetected
+    availability: Literal[...]   # per-variant
+    size: str | None             # parsed from description
+    pack_quantity: int | None    # parsed
+    pack_unit: str | None        # parsed
+    image: str | None
+    main_image: str | None
+    is_synthetic: bool           # True if this row was synthesized from parent
+                                 # (page had no masterData)
 ```
 
-**Dedup key:** `sku:<sku>` when present, `url:<sha1(canonical_url)>` otherwise.
+`brand` (manufacturer) and `retailer` ("Safco Dental") are kept distinct so that the JSON-LD's tendency to label every product as `Safco Dental`-branded doesn't pollute the catalog.
+
+**Dedup keys**
+- `Product.dedup_key`: `sku:<lower>` if SKU present, else `url:<sha1>`.
+- `Variant.dedup_key`: `variant:<parent_dedup_key>:<safco_item_number>` (with fallbacks through `manufacturer_number` and `name` so missing parent SKUs never collide).
+
+---
+
+## Output Files
+
+A crawl writes to `output/` (configurable via `paths.exports_dir`). All files are produced from the same SQLite source of truth so they stay in sync.
+
+| File | Grain | Purpose |
+|---|---|---|
+| `output/products_all.csv` | one row per **variant** | Master flat export — easiest for spreadsheet review |
+| `output/products_gloves.csv` | one row per **variant** | Same shape, filtered to the gloves seed |
+| `output/products_sutures_surgical.csv` | one row per **variant** | Same shape, filtered to sutures/surgical seed |
+| `output/specifications.jsonl` | one line per **parent** | Catalog-shaped: nested variants, parsed specs, `extraction_quality` block |
+| `output/products_grouped.json` | array of **parents** | Pretty-printed JSON twin of the JSONL — human-readable |
+| `data/products.db` | SQLite | Source-of-truth for queries |
+
+Row-count invariant: `products_all.csv == products_gloves.csv + products_sutures_surgical.csv` (excluding headers). Per-seed CSVs are added automatically for any new seed in `crawler.yaml` — naming follows `products_{slug}.csv` where the slug strips a trailing `-products` and replaces hyphens with underscores.
+
+### CSV columns
+Variant-grain rows include both **parent context** (`parent_sku`, `parent_name`, `parent_description`, `category_path_str`, `product_url`, `source_seed`, `retailer`) and **variant fields** (`sku`, `product_code`, `safco_item_number`, `product_name`, `manufacturer_number`, `brand`, `description`, `size`, `pack_quantity`, `pack_unit`, `price`, `price_text`, `currency`, `availability`, `availability_label`, `variant_image`, `image_urls_str`, `extracted_at`, `is_synthetic`).
+
+The aliases `sku`, `name`, and `product_code` all mirror `safco_item_number` / `product_name` so a reviewer scanning the file finds familiar columns without consulting docs.
+
+### specifications.jsonl shape
+One line per parent product:
+```json
+{
+  "parent_sku": "DRCDK",
+  "parent_name": "Alasta Pro",
+  "brand": "Dash",
+  "retailer": "Safco Dental",
+  "category_path": ["Dental Supplies", "Dental Exam Gloves", "Nitrile gloves"],
+  "category_path_str": "Dental Supplies > Dental Exam Gloves > Nitrile gloves",
+  "product_url": "https://www.safcodental.com/product/alasta-pro",
+  "description": "Powder-free nitrile exam gloves...",
+  "specifications": {
+    "material": "nitrile",
+    "powder_free": true,
+    "color": "blue",
+    "thickness_palm_mils": 3.1,
+    "thickness_fingertip_mils": 3.9,
+    "case_quantity_boxes": 10
+  },
+  "variants": [
+    {"safco_item_number": "4681214", "size": "X-small",
+     "pack_quantity": 200, "pack_unit": "box",
+     "manufacturer_number": "ALGA200XS", "brand": "Dash",
+     "price": 23.49, "availability": "backorder", ...},
+    ...
+  ],
+  "images": ["https://.../drcdk.jpg"],
+  "alternative_products": [],
+  "extraction_quality": {
+    "spec_source": "glove-rules",
+    "has_variants": true,
+    "variant_count": 5,
+    "placeholder_images_filtered": true,
+    "missing_fields": ["alternative_products", "currency"]
+  },
+  "extracted_at": "..."
+}
+```
+
+### Specifications parsing
+`specifications.jsonl` enriches each parent record with attributes parsed from descriptions using **deterministic rules** (regex — no LLM). Two extractor families:
+- **Glove rules**: material, powder_free, latex_free, sterile, color, cuff, texture, chlorinated, ambidextrous, thickness (palm/fingertip/generic, in mils), case_quantity_boxes
+- **Surgical rules**: suture_size (e.g. `4-0`), absorbable, sterile, material (silk/nylon/PTFE/...), dimensions (`15 x 20mm`), needle_length_mm
+
+The active rule set is logged per-record in `extraction_quality.spec_source`. Attributes that can't be parsed are omitted — never guessed.
+
+### Image filtering
+Magento serves a default "white-placeholder" image until a real photo exists. Any URL containing `placeholder`, `white-placeholder`, or `/placeholder/default/` is **filtered** from `images`, `image_urls_str`, and `variant_image`. Fallback order is variant-image → parent-image → null.
+
+### Text cleanup
+Every exported string passes through a shared `clean_export_text` helper that decodes HTML entities (loops to handle double-encoding like `&amp;nbsp;`), strips inline tags, and collapses whitespace. Real symbols (`®`, `™`) survive unchanged.
 
 ---
 
@@ -137,15 +225,64 @@ docker-compose up crawl
 ## CLI Commands
 
 ```
-safco crawl          Run full agent pipeline on all configured seeds
-safco crawl -s gloves                     Single seed
-safco discover       Print URL frontier without crawling
-safco report         Tail the latest data-quality report
-safco stats          Quick brand/count table from the live DB
-safco schema-dump    Write JSON Schema to data/exports/schema.json
+safco crawl                 Run full agent pipeline on all configured seeds
+safco crawl -s gloves       Single seed
+safco discover              Print URL frontier without crawling
+safco report                Tail the latest data-quality report
+safco stats                 Quick brand/count table from the live DB
+safco schema-dump           Write JSON Schema to output/schema.json
+
+# Seed management — edit config/crawler.yaml without leaving the terminal
+safco seeds                 List currently configured seeds
+safco add <url> [--label]   Add a new category URL to the seed list
+safco remove <id> [--yes]   Remove a seed by its id
 ```
 
 Use `--config path/to/crawler.yaml` on any command to override the default config.
+
+### Adding a new category — example workflow
+
+The CLI lets you add a Safco catalog URL as a new seed without editing YAML by hand. The seed `id` is auto-derived from the URL slug, and the human-readable `label` from a title-cased version (override with `--label` if you want).
+
+```bash
+# 1. Add a new category
+safco add https://www.safcodental.com/catalog/infection-control
+# → Added seed: id=infection-control, label=Infection Control
+#   Suggests: safco discover --seed infection-control
+
+# 2. Preview the product frontier without committing to a full crawl
+safco discover --seed infection-control
+# → infection-control: 87 products
+#     https://www.safcodental.com/product/...
+
+# 3. Crawl just that seed (existing data in the DB is preserved)
+safco crawl --seed infection-control
+
+# 4. Inspect what landed
+safco seeds                                  # confirm new seed shows in the table
+sqlite3 data/products.db "SELECT manufacturer_name, COUNT(*) FROM variants GROUP BY 1 ORDER BY 2 DESC;"
+ls output/                                   # products_infection_control.csv now exists
+```
+
+**A note on output behavior:**
+- `safco crawl` always rewrites `output/*.csv` and `output/*.jsonl` from the SQLite DB. The DB is the source of truth — everything you've ever crawled stays in it (idempotent upserts) until you delete `data/products.db`.
+- Per-seed CSVs (`products_<slug>.csv`) are emitted automatically for every seed in `crawler.yaml`, even if you only crawled some of them this run.
+- To start clean, `rm data/products.db` before the next crawl.
+
+### Removing a seed
+
+```bash
+safco remove infection-control               # prompts to confirm
+safco remove infection-control --yes         # script-friendly, no prompt
+```
+
+`safco remove` only edits `crawler.yaml` — it doesn't delete crawled rows. To purge an already-crawled category from the database too:
+
+```bash
+sqlite3 data/products.db "DELETE FROM products WHERE source_seed='infection-control';"
+# Variants cascade-delete via foreign key.
+safco crawl                                  # regenerate exports
+```
 
 ---
 
@@ -195,64 +332,83 @@ make test
 ```
 
 ```
-17 passed in 3.57s
+48 passed in 1.29s
 tests/test_classifier.py   — URL + DOM classification heuristics
-tests/test_extractor.py    — JSON-LD extraction, breadcrumbs, canonicalization, dedup key
-tests/test_storage.py      — upsert idempotency, CSV/JSONL roundtrip, crawl-state lifecycle
-tests/test_validator.py    — Pydantic acceptance, SKU dedup, URL-hash dedup
+tests/test_extractor.py    — JSON-LD + masterData extraction, alasta-pro regression
+tests/test_exporters.py    — variant-grain CSV, per-seed split, JSONL shape, spec parsing
+tests/test_storage.py      — upsert idempotency, FK cascade, variant replacement
+tests/test_validator.py    — Pydantic acceptance, SKU/URL/variant dedup
 ```
 
 ---
 
 ## Sample Run (committed)
 
-Captured 2026-05-06 — both seeds, 50-product cap.
+Captured 2026-05-07 — both assignment seeds (gloves + sutures-surgical-products), 50-product cap per seed. **97 parent products → 463 purchasable variants.**
 
 | Metric | Value |
 |---|---|
-| Pages visited | 50 |
-| Products extracted | 49 |
-| Duplicates skipped | 1 |
+| Pages visited | 98 |
+| Parent products extracted | 97 |
+| Variants extracted | 463 |
+| Product duplicates skipped | 1 |
+| Variant duplicates skipped | 0 |
 | Failed pages | 0 |
 | LLM fallback calls | 0 |
-| Latency p50 | 1133 ms |
-| Latency p95 | 1822 ms |
-| Extraction method | JSON-LD (100% of fields) |
+| Latency p50 | 1172 ms |
+| Latency p95 | 1864 ms |
+| Extraction method | JSON-LD + masterData (100% deterministic) |
+| Pack-size source | description-heuristic 98%, specs-heuristic 2% |
+
+The committed sample lives in `data/samples/` and mirrors what a live crawl emits to `output/`:
 
 ```
-data/samples/
-├── products.csv         — flat export (49 rows)
-├── products.jsonl       — one JSON object per line
-├── specifications.csv   — key/value specs (normalized)
-├── run-report.md        — human-readable quality report
-└── run-report.json      — machine-readable version
+data/samples/                         ← committed reference dataset
+├── products_all.csv                  flat, one row per variant (463 rows)
+├── products_gloves.csv               variant rows, gloves only       (188 rows)
+├── products_sutures_surgical.csv     variant rows, sutures only      (275 rows)
+├── specifications.jsonl              one parent per line             (97 lines)
+├── products_grouped.json             pretty-printed JSON array       (97 parents)
+├── run-report.md                     human-readable quality report
+└── run-report.json                   machine-readable version
+
+output/                               ← live runtime (gitignored)
+├── products_all.csv                  same files as samples, regenerated each crawl
+├── products_gloves.csv
+├── products_sutures_surgical.csv
+├── specifications.jsonl
+└── products_grouped.json
+
+data/
+├── products.db                       SQLite source of truth (gitignored)
+└── reports/run-{ts}.{md,json}     per-run quality report
 ```
 
 ### Sample SQL queries
 
 ```sql
--- Products by brand
-SELECT COALESCE(brand,'<unknown>') AS brand, COUNT(*) AS n
-FROM products
+-- Variants by manufacturer brand (the actual mfr, not the retailer)
+SELECT COALESCE(manufacturer_name,'<unknown>') AS brand, COUNT(*) AS n
+FROM variants
 GROUP BY brand ORDER BY n DESC LIMIT 10;
 
--- Average price by category
-SELECT c.label, ROUND(AVG(p.price_cents) / 100.0, 2) AS avg_price_usd
-FROM products p
-JOIN product_categories pc ON pc.product_id = p.id
-JOIN categories c ON c.id = pc.category_id
-GROUP BY c.label ORDER BY avg_price_usd DESC;
+-- Variants per parent product (catalog depth check)
+SELECT p.name AS parent, COUNT(v.dedup_key) AS variant_count
+FROM products p JOIN variants v ON v.parent_dedup_key = p.dedup_key
+GROUP BY p.name ORDER BY variant_count DESC LIMIT 10;
 
--- In-stock vs out-of-stock
-SELECT availability, COUNT(*) FROM products GROUP BY availability;
+-- Per-variant availability mix
+SELECT availability, COUNT(*) FROM variants GROUP BY availability;
 
--- Extraction method distribution
-SELECT field, method, COUNT(*) AS n
-FROM extraction_methods GROUP BY field, method ORDER BY n DESC;
+-- Pack size distribution for gloves
+SELECT pack_quantity, pack_unit, COUNT(*) AS n
+FROM variants v JOIN products p ON p.dedup_key = v.parent_dedup_key
+WHERE p.source_seed = 'gloves'
+GROUP BY pack_quantity, pack_unit ORDER BY n DESC;
 
 -- Recent run history
-SELECT run_id, started_at, finished_at, products_accepted, products_failed
-FROM crawl_runs ORDER BY started_at DESC LIMIT 5;
+SELECT run_id, started_at, finished_at, products_extracted, failures
+FROM run_log ORDER BY started_at DESC LIMIT 5;
 ```
 
 ---
@@ -298,8 +454,13 @@ Every failure path is handled at three levels:
 
 - **Product cap** — demo defaults to 50 products/seed; set `limits.max_products_per_seed: null` for a full crawl (~25–30 min)
 - **`?page=` pagination** — disallowed by `robots.txt`; we bypass it via sitemap (`products.xml`, ~1200 URLs) + listing-page render
-- **Variant pricing** — SKU variants without individual detail URLs are recorded as `specifications.variants`; per-variant pricing may be incomplete
-- **LLM fallback** — requires `ANTHROPIC_API_KEY` and `llm.enabled: true` in config; the default deterministic pipeline handled 100% of the sample run without it
+- **Pack parsing is best-effort** — `pack_quantity` / `pack_unit` are parsed from variant descriptions like `"X-small, 200/box"` using a strict regex. Non-matching phrasings fall back to a heuristic search; some sutures items genuinely don't expose a pack size on the page.
+- **Currency is intentionally blank** — Safco's variant data exposes a numeric price but no currency code, so we never default to `"USD"`. Parent-level JSON-LD does carry `priceCurrency`; that's reflected on the parent record but not propagated into variant rows.
+- **Alternative products are not currently extracted** — Safco doesn't expose related-product links in a structured way for these categories. The field is preserved in the JSONL output (`alternative_products: []`) and surfaces in `extraction_quality.missing_fields` so the gap is auditable.
+- **Placeholder images are filtered** — Magento's default "white-placeholder" / `/placeholder/default/` URLs are silently dropped from every export; only real product imagery makes it through.
+- **Some surgical specs live only in raw text** — for surgical/suture products that use long-form prose (bone graft materials, hemostatic agents, etc.), dimension and pack info is preserved in the `description` but may not be normalized into the `specifications` object.
+- **Spec parsing is rule-based, not exhaustive** — the deterministic rules in `spec_parser.py` cover the most common attributes for gloves and sutures. Attributes that don't match the rules are omitted (never guessed). The active rule set is logged per-record in `extraction_quality.spec_source`.
+- **LLM fallback** — requires `ANTHROPIC_API_KEY` and `llm.enabled: true` in config; the default deterministic pipeline handled 100% of the sample run without it.
 
 ---
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from safco_agent.schema import Product
+from safco_agent.schema import Product, Variant
 from safco_agent.storage.exporters import export_csv, export_jsonl
 from safco_agent.storage.sqlite import Store
 
@@ -32,6 +32,24 @@ def _make(sku: str = "ABC1") -> Product:
     )
 
 
+def _make_variant(parent: Product, item_no: str, mfr: str = "Acme") -> Variant:
+    return Variant(
+        parent_dedup_key=parent.dedup_key,
+        parent_sku=parent.sku,
+        safco_item_number=item_no,
+        manufacturer_number=f"MFR-{item_no}",
+        manufacturer_name=mfr,
+        name=f"{parent.name} variant {item_no}",
+        description="Medium, 100/box",
+        price=Decimal("9.99"),
+        price_text="9.990000",
+        availability="in_stock",
+        size="Medium",
+        pack_quantity=100,
+        pack_unit="box",
+    )
+
+
 def test_upsert_then_idempotent(store: Store) -> None:
     p = _make("S1")
     store.upsert_product(p)
@@ -43,15 +61,43 @@ def test_upsert_then_idempotent(store: Store) -> None:
     assert store.images_for(p.dedup_key) == ["https://x.test/img/1.jpg"]
 
 
+def test_variant_upsert_replaces_not_duplicates(store: Store) -> None:
+    p = _make("S1")
+    store.upsert_product(p)
+    v1 = [_make_variant(p, "1001"), _make_variant(p, "1002")]
+    v2 = [_make_variant(p, "1001"), _make_variant(p, "1002"), _make_variant(p, "1003")]
+    store.upsert_variants(p.dedup_key, v1)
+    assert store.variant_count() == 2
+    store.upsert_variants(p.dedup_key, v2)
+    assert store.variant_count() == 3  # third variant added, others replaced in place
+    store.upsert_variants(p.dedup_key, v1)
+    assert store.variant_count() == 2  # third variant cleanly removed
+
+
 def test_export_roundtrip(store: Store, tmp_path: Path) -> None:
-    store.upsert_product(_make("S1"))
-    store.upsert_product(_make("S2"))
+    p1, p2 = _make("S1"), _make("S2")
+    store.upsert_product(p1)
+    store.upsert_product(p2)
+    store.upsert_variants(p1.dedup_key, [_make_variant(p1, "1001"), _make_variant(p1, "1002")])
+    store.upsert_variants(p2.dedup_key, [_make_variant(p2, "2001")])
     n_csv = export_csv(store, tmp_path / "p.csv")
     n_jsonl = export_jsonl(store, tmp_path / "p.jsonl")
-    assert n_csv == 2
+    # CSV is now variant-grain (3 variants), JSONL is still parent-grain (2 products)
+    assert n_csv == 3
     assert n_jsonl == 2
     csv_text = (tmp_path / "p.csv").read_text(encoding="utf-8")
-    assert "S1" in csv_text and "S2" in csv_text
+    assert "1001" in csv_text and "2001" in csv_text
+    assert "Safco Dental" in csv_text  # retailer column
+
+
+def test_variant_fk_cascade_removes_on_parent_delete(store: Store) -> None:
+    p = _make("S1")
+    store.upsert_product(p)
+    store.upsert_variants(p.dedup_key, [_make_variant(p, "1001")])
+    assert store.variant_count() == 1
+    store._conn.execute("DELETE FROM products WHERE dedup_key=?", (p.dedup_key,))
+    store._conn.commit()
+    assert store.variant_count() == 0  # FK cascade removed the orphan variant
 
 
 def test_crawl_state_lifecycle(store: Store) -> None:

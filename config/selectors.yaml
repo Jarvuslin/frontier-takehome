@@ -54,6 +54,8 @@ product_page:
     - { sel: "table.product-specs tr", multi: true }
     - { sel: ".product-specifications dl > *", multi: true }
     - { sel: ".specs-table tr", multi: true }
+    # Safco uses a prose div with bullet lists for product attributes
+    - { sel: "div.prose ul li", multi: true }
   alternatives:
     - { sel: ".related-products a.product-link", attr: href, multi: true }
     - { sel: ".alternatives a", attr: href, multi: true }
